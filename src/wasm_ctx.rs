@@ -16,6 +16,7 @@ pub struct WASMArgsBuilder {
   invoke: String,
   func_args: Vec<String>,
   trace_slice_vals: Option<TraceSliceValues>,
+  step_inputs: Vec<u8>,
 }
 
 impl WASMArgsBuilder {
@@ -45,6 +46,12 @@ impl WASMArgsBuilder {
     self
   }
 
+  /// Set per-step inputs for WASM-4 games
+  pub fn step_inputs(mut self, step_inputs: Vec<u8>) -> Self {
+    self.step_inputs = step_inputs;
+    self
+  }
+
   /// Set the `start` and `end` values to slice the execution trace
   pub fn trace_slice(mut self, trace_slice_vals: TraceSliceValues) -> Self {
     self.trace_slice_vals = Some(trace_slice_vals);
@@ -58,6 +65,7 @@ impl WASMArgsBuilder {
       func_args: self.func_args,
       invoke: self.invoke,
       trace_slice_vals: self.trace_slice_vals,
+      step_inputs: self.step_inputs,
     }
   }
 }
@@ -69,6 +77,7 @@ pub struct WASMArgs {
   pub(crate) invoke: String,
   pub(crate) func_args: Vec<String>,
   pub(crate) trace_slice_vals: Option<TraceSliceValues>,
+  pub(crate) step_inputs: Vec<u8>,
 }
 
 impl WASMArgs {
@@ -93,6 +102,11 @@ impl WASMArgs {
   /// Get reference to bytecode.
   pub fn bytecode(&self) -> &[u8] {
     &self.program
+  }
+
+  /// Get step inputs
+  pub fn step_inputs(&self) -> &[u8] {
+    &self.step_inputs
   }
 
   /// Get the end slice value after WASM execution
@@ -124,6 +138,7 @@ impl Default for WASMArgsBuilder {
       invoke: "main".to_string(),
       func_args: vec![],
       trace_slice_vals: None,
+      step_inputs: vec![],
     }
   }
 }
@@ -278,7 +293,7 @@ impl WASMCtx {
 }
 
 impl ZKWASMCtx for WASMCtx {
-  type T = ();
+  type T = (); 
 
   fn create_store(&self, engine: &wasmi::Engine) -> wasmi::Store<Self::T> {
     wasmi::Store::new(engine, ())
@@ -294,6 +309,88 @@ impl ZKWASMCtx for WASMCtx {
 
   fn args(&self) -> &WASMArgs {
     &self.args
+  }
+}
+
+/// WASM4 execution context to replay button inputs for proving
+#[derive(Debug, Clone)]
+pub struct Wasm4Ctx {
+  args: WASMArgs,
+}
+
+impl Wasm4Ctx {
+  /// Create a new instance of [`Wasm4Ctx`]
+  pub fn new(args: WASMArgs) -> Self {
+    Self { args }
+  }
+}
+
+impl ZKWASMCtx for Wasm4Ctx {
+  type T = (); 
+
+  fn create_store(&self, engine: &wasmi::Engine) -> wasmi::Store<Self::T> {
+    wasmi::Store::new(engine, ())
+  }
+
+  fn create_linker(
+    &self,
+    engine: &wasmi::Engine,
+    _module: &wasmi::Module,
+  ) -> Result<wasmi::Linker<Self::T>, ZKWASMError> {
+    Ok(<wasmi::Linker<()>>::new(engine))
+  }
+
+  fn args(&self) -> &WASMArgs {
+    &self.args
+  }
+
+  fn execution_trace(&self) -> Result<ExecutionTrace, ZKWASMError> {
+    let tracer = Rc::new(RefCell::new(Tracer::new()));
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, &self.args().program[..])?;
+
+    let mut store = self.create_store(&engine);
+    let linker = self.create_linker(&engine, &module)?;
+    let instance = linker
+      .instantiate_with_trace(&mut store, &module, tracer.clone())?
+      .start(&mut store)?;
+
+    let func = instance
+      .get_func(&store, &self.args().invoke)
+      .ok_or_else(|| {
+        ZKWASMError::WasmiError(wasmi::Error::Func(
+          wasmi::errors::FuncError::ExportedFuncNotFound,
+        ))
+      })?;
+    let ty = func.ty(&store);
+    let mut func_results = prepare_func_results(&ty);
+    let memory = instance
+      .get_memory(&store, "memory")
+      .ok_or_else(|| ZKWASMError::WASMError("exported memory not found".into()))?;
+
+    for &input in self.args.step_inputs() {
+      memory
+        .write(&mut store, 0x16, &[input])
+        .map_err(|e| ZKWASMError::WasmiError(e.into()))?;
+      func.call_with_trace(&mut store, &[], &mut func_results, tracer.clone())?;
+    }
+
+    tracing::debug!("wasm func res: {:#?}", func_results);
+
+    let mut tracer = unwrap_rc_refcell(tracer);
+    tracer.truncate_unuesed_mem();
+    let IS_stack_len = tracer.IS_stack_len();
+    let IS_mem_len = tracer.IS_mem_len();
+    let IS = tracer.IS();
+    let execution_trace = tracer.into_execution_trace();
+    let end_slice = self.args().end(execution_trace.len())?;
+    let execution_trace = execution_trace[..end_slice].to_vec();
+
+    Ok((
+      execution_trace,
+      IS,
+      ISMemSizes::new(IS_stack_len, IS_mem_len),
+    ))
   }
 }
 
